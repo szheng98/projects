@@ -1,0 +1,239 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(corrgram)
+library(corrplot)
+library(ggplot2)
+library(gains)
+library(caret)
+library(plyr)
+library(class)
+library(MASS)
+library(e1071)
+library(naivebayes)
+```
+
+```{r}
+game = read.csv("game_teams_stats.csv", header = TRUE)
+game = game[-c(1, 2, 6)]
+head(game)
+```
+
+1. Data Cleaning
+```{r}
+#categorize home and away games
+colnames(game)[1] = "home"
+game$home = as.integer(game$home)
+game$home[game$home=="1"] = 0
+game$home[game$home=="2"] = 1
+```
+
+```{r}
+#categorize game wins (dependent variable)
+game$won[game$won=='FALSE'] = 0
+game$won[game$won=='TRUE'] = 1
+```
+
+```{r}
+#categorize regular and OT games
+colnames(game)[3] = "reg"
+game$reg = as.integer(game$reg)
+game$reg[game$reg=="1"] = 0
+game$reg[game$reg=="2"] = 1
+```
+
+```{r}
+#change order of columns so that dependent variable is first
+game = game[c(2, 1, 3:dim(game)[2])]
+```
+
+2. Data Visualization
+```{r}
+#correlation matrix
+corrplot(corrgram(game), method = "number")
+```
+
+```{r}
+ggplot(data = game) +
+  geom_point(mapping = aes(x = goals, y = powerPlayGoals, color = won))
+```
+```{r}
+#Teams with who score 2 or more goals on power play opportunities are more likely to win
+ggplot(data = game) +
+  geom_point(mapping = aes(x = powerPlayOpportunities, y = powerPlayGoals, color = won))
+```
+
+
+```{r}
+plot(won ~ ., data=game, main="Win Data against Predictor Variables")
+```
+
+3. Training and Testing Sets
+```{r}
+set.seed(3)
+train.index = sample(c(1:dim(game)[1]), dim(game)[1]*0.6)
+training = game[train.index,]
+testing = game[-train.index,]
+```
+
+4. Models
+Model 1: Logistic Regression
+```{r}
+#step wise backwards: remove hits, powerPlayOpportunities, and faceOffWinPercentage because they are not significiant
+summary(glm(won~., family=binomial(logit), data=training))
+stepAIC(glm(won~., family=binomial(logit), data=training), direction = "backward", trace = FALSE)
+```
+```{r}
+#final model
+logit = glm(formula = won ~ home + reg + goals + shots + pim + powerPlayGoals + giveaways + takeaways, family = binomial(logit), data = training)
+summary(logit)
+```
+
+```{r}
+#predictions
+logit.probs = predict(logit, testing, type="response")
+logit.pred = ifelse(logit.probs>0.5, 1, 0)
+```
+
+```{r}
+#lift chart
+logit.gain = gains(testing$won, logit.probs)
+
+test.heights = logit.gain$mean.resp/mean(testing$won)
+
+test.midpoints = barplot(test.heights,names.arg=logit.gain$depth,ylim=c(0,4),xlab="percentile",ylab="mean response", main = "Logistic Regression: Decile-Wise Lift Chart")
+#text(test.midpoints, test.heights+0.5, labels=round(test.heights, 1), cex = 0.8)
+```
+
+```{r}
+#confusion matrix
+logit.cm = confusionMatrix(factor(round(logit.pred)), factor(testing$won)); logit.cm
+```
+
+Model 2: Naive Bayes
+```{r}
+#data for naive bayes
+processed <- preProcess(game, method=("range"))
+game.nb <- predict(processed, game)
+head(game.nb)
+```
+
+```{r}
+#naive bayes
+training.nb = game.nb[train.index,]
+testing.nb = game.nb[-train.index,]
+nb = naiveBayes(won ~., data = training.nb)
+```
+
+```{r}
+# predict probabilities
+nb.probs = predict(nb,testing.nb,type = "raw")
+nb.probs = nb.probs[,c(-1)]
+nb.res = nb.probs
+nb.res[ nb.res <0.5 ] = 0
+nb.res[ nb.res >= 0.5 ] = 1
+
+```
+
+```{r}
+#lift chart
+nb.gain = gains(testing$won, nb.probs)
+nb.test.heights = nb.gain$mean.resp/mean(testing$won)
+test.midpoints = barplot(nb.test.heights,names.arg=nb.gain$depth,ylim=c(0,4),xlab="percentile",ylab="mean response", main = "Naive Bayes: Decile-Wise Lift Chart")
+```
+
+```{r}
+# Confusion Metrix
+nb.confmat = table(Actual_Value = testing.nb$won, Predicted_Value=nb.res)
+confusionMatrix(nb.confmat)
+```
+
+Model 3: KNN
+```{r}
+#normalize training set for knn
+training.norm = training 
+for(i in 2:dim(training)[2]) {
+  training.norm[i] = (training[i] - mean(training[,i]))/sd(training[,i])
+}
+training.norm = cbind(training[c(1:3)], training.norm[c(4:12)])
+
+#normalize testing set
+testing.norm = testing 
+for(i in 2:dim(training)[2]) {
+  testing.norm[i] = (testing[i] - mean(testing[,i]))/sd(testing[,i])
+}
+testing.norm = cbind(testing[c(1:3)], testing.norm[c(4:12)])
+```
+
+```{r}
+#Set with features and set with labels
+training.norm.features = subset(training.norm, select=c(-won))
+training.norm.labels = training.norm$won
+
+testing.norm.features = subset(testing.norm, select=c(-won))
+testing.norm.labels = testing.norm$won
+```
+
+```{r}
+#find optimal k
+accuracy.df <- data.frame(k = seq(1, 100, 1), accuracy = rep(0, 100))
+for (i in 1:100) { 
+    knn =  knn(training.norm.features, testing.norm.features, training.norm.labels, k=i)
+    accuracy.df[i, 2] <- confusionMatrix(factor(knn), factor(testing.norm.labels))$overall[1]
+}
+accuracy.df
+plot(accuracy.df)
+bestk = min(which(accuracy.df[,2]==max(accuracy.df[,2])))
+cat("The optimal k for knn is", bestk)
+```
+
+```{r}
+#final model
+
+knn.pred = knn(training.norm.features, testing.norm.features, training.norm.labels, k=bestk)
+knn.cm = confusionMatrix(factor(knn.pred), factor(testing.norm.labels))$overall[1]; knn.cm
+```
+
+
+```{r}
+# Major vote
+knn.pred = as.numeric(knn.pred) - 1
+res = ifelse(nb.res + knn.pred + as.numeric(logit.pred) > 1, 1,0)
+res.confmat = table(Actual_Value = testing.nb$won, Predicted_Value=res)
+confusionMatrix(res.confmat)
+```
+
+
+
+
+5. Application: Use the predicted probability of winning for each team to predict which team would win in a match against each other. ie: if team 1 and 2 played against each other, which ever team had the higher predicted probability of winning would be the predicted winner. Then compare this prediction to the actual data of matches between team 1 and 2. 
+
+
+```{r}
+#data for each team
+newdata = read.csv("teams_stats.csv")
+probs = predict(logit, newdata, type="response")
+head(newdata)
+```
+
+
+```{r}
+# generate win rate prediction matrix 
+probs = predict(logit, newdata, type="response")
+probs = (probs - mean(probs)) / sd(probs)
+winrate = matrix(0, nrow = 33, ncol = 33, dimnames = list(c(1:30,52,53,54), c(1:30,52,53,54)))
+for (i in c(1:33)){
+  for (j in c(1:33)){
+    winrate[i,j] = round(exp(probs[i])/(exp(probs[i]) + exp(probs[j])), digits = 2)
+  }
+}
+winrate[20:33, 20:33]
+```
+
+
+
+```{r}
+```
+
